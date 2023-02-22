@@ -36,7 +36,7 @@ from timm.loss import *
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
-import efficient_transformer
+import seaformer
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
@@ -476,11 +476,11 @@ def main():
             # Apex DDP preferred unless native amp is activated
             if args.local_rank == 0:
                 _logger.info("Using NVIDIA APEX DistributedDataParallel.")
-            model = ApexDDP(model, delay_allreduce=True, find_unused_parameters=True)
+            model = ApexDDP(model, delay_allreduce=True, find_unused_parameters=False)
         else:
             if args.local_rank == 0:
                 _logger.info("Using native Torch DistributedDataParallel.")
-            model = NativeDDP(model, device_ids=[args.local_rank], find_unused_parameters=True, broadcast_buffers=not args.no_ddp_bb)
+            model = NativeDDP(model, device_ids=[args.local_rank], find_unused_parameters=False, broadcast_buffers=not args.no_ddp_bb)
         # NOTE: EMA model does not need to be wrapped by DDP
 
     # setup learning rate schedule and starting epoch

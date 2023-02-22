@@ -8,7 +8,7 @@ from mmcv.cnn import build_norm_layer
 from timm.models.registry import register_model
 
 
-def _make_divisible(v, divisor, min_value=None):
+def _make_divisible(v, divisor=8, min_value=None):
     """
     This function is taken from the original tf repo.
     It ensures that all layers have a channel number that is divisible by 8
@@ -80,10 +80,16 @@ class Conv2d_BN(nn.Sequential):
         # self.bias = bias
         self.add_module('c', nn.Conv2d(
             a, b, ks, stride, pad, dilation, groups, bias=bias))
-        bn = build_norm_layer(norm_cfg, b)[1]
-        nn.init.constant_(bn.weight, bn_weight_init)
-        nn.init.constant_(bn.bias, 0)
-        self.add_module('bn', bn)
+        if norm_cfg != '':
+            if norm_cfg == 'hardswish':
+                bn = nn.Hardswish()
+            elif norm_cfg == 'relu':
+                bn = nn.ReLU()
+            else:       
+                bn = build_norm_layer(norm_cfg, b)[1]
+                nn.init.constant_(bn.weight, bn_weight_init)
+                nn.init.constant_(bn.bias, 0)
+            self.add_module('bn', bn)
 
 
 class Mlp(nn.Module):
@@ -288,6 +294,8 @@ class Block(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
+        # self.norm1 = nn.LayerNorm([dim,7,7])
+        # self.norm2 = nn.LayerNorm([dim, 4, 4])
        
         self.attn = Sea_Attention(dim, key_dim=key_dim, num_heads=num_heads, attn_ratio=attn_ratio,
                                       activation=act_layer, norm_cfg=norm_cfg)
@@ -299,6 +307,10 @@ class Block(nn.Module):
     def forward(self, x1):
         x1 = x1 + self.drop_path(self.attn(x1))
         x1 = x1 + self.drop_path(self.mlp(x1))
+        # x1 = x1 + self.drop_path(self.attn(self.norm1(x1)))
+        # import pdb; pdb.set_trace()
+        # x1 = x1 + self.drop_path(self.attn(self.norm2(x1)))
+
         return x1
 
 
@@ -335,37 +347,118 @@ class h_sigmoid(nn.Module):
         return self.relu(x + 3) / 6
 
 
-class Fusion_block(nn.Module):
-    def __init__(
-            self,
-            inp: int,
-            oup: int,
-            fuse_type='bi',
-            norm_cfg=dict(type='BN', requires_grad=True),
-            activations=None,
-    ) -> None:
-        super(InjectionMultiSum, self).__init__()
-        self.norm_cfg = norm_cfg
-        self.local_embedding = ConvModule(inp, oup, kernel_size=1, norm_cfg=self.norm_cfg, act_cfg=None)
-        self.global_act = ConvModule(oup, oup, kernel_size=1, norm_cfg=self.norm_cfg, act_cfg=None)
-        self.act = h_sigmoid()
+class SEModule(nn.Module):
+    def __init__(self, channel, reduction=4):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv1 = nn.Conv2d(
+            in_channels=channel,
+            out_channels=channel // reduction,
+            kernel_size=1,
+            stride=1,
+            padding=0)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv2d(
+            in_channels=channel // reduction,
+            out_channels=channel,
+            kernel_size=1,
+            stride=1,
+            padding=0)
+        self.hardsigmoid = nn.Hardsigmoid()
 
-        self.fuse_type = fuse_type
+    def forward(self, x):
+        identity = x
+        x = self.avg_pool(x)
+        x = self.conv1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.hardsigmoid(x)
+        out = torch.mul(input=identity, other=x)
+        return out
 
-    def forward(self, x_l, x_g):
-        '''
-        x_g: global features
-        x_l: local features
-        '''
-        B, C, H, W = x_l.shape
-        B, C_c, H_c, W_c = x_g.shape
 
-        local_feat = self.local_embedding(x_l)
-        global_act = self.global_act(x_g)
-        sig_act = F.interpolate(self.act(global_act), size=(H, W), mode='bilinear', align_corners=False)
-        global_feat = F.interpolate(global_feat, size=(H, W), mode='bilinear', align_corners=False)
-        out_detail = local_feat * sig_act
+class ResidualUnit(nn.Module):
+    def __init__(self,
+                 in_c,
+                 mid_c,
+                 out_c,
+                 filter_size,
+                 stride,
+                 use_se,
+                 act=None,
+                 dilation=1):
+        super().__init__()
+        self.if_shortcut = stride == 1 and in_c == out_c
+        self.if_se = use_se
 
+        self.expand_conv = Conv2d_BN(in_c, mid_c, 1, 1, 0, norm_cfg=act)
+        self.bottleneck_conv = Conv2d_BN(mid_c, mid_c, filter_size,stride, int((filter_size - 1) // 2) * dilation,
+                                dilation, mid_c, norm_cfg=act)
+        if self.if_se:
+            self.mid_se = SEModule(mid_c)
+        self.linear_conv = Conv2d_BN(mid_c, out_c, 1, 1, 0, norm_cfg='')
+
+
+    def forward(self, x):
+        identity = x
+        x = self.expand_conv(x)
+        x = self.bottleneck_conv(x)
+        if self.if_se:
+            x = self.mid_se(x)
+        
+        x = self.linear_conv(x)
+        if self.if_shortcut:
+            x = torch.add(identity, x)
+        return x
+
+
+class StackedMV3Block(nn.Module):
+    """
+    MobileNetV3
+    Args:
+        config: list. MobileNetV3 depthwise blocks config.
+        in_channels (int, optional): The channels of input image. Default: 3.
+        scale: float=1.0. The coefficient that controls the size of network parameters. 
+    Returns:
+        model: nn.Layer. Specific MobileNetV3 model depends on args.
+    """
+
+    def __init__(self,
+                 cfgs,
+                 stem,
+                 inp_channel,
+                 norm_cfg,
+                 in_channels=3,
+                 scale=1.0):
+        super().__init__()
+
+        self.scale = scale
+        self.stem = stem
+
+        if self.stem:
+            self.conv = Conv2d_BN(3, _make_divisible(inp_channel * self.scale), 3,2,1, norm_cfg='hardswish')
+        self.blocks = nn.ModuleList()
+        for i, (k, exp, c, se, act, s) in enumerate(cfgs):
+            self.blocks.append(            
+                ResidualUnit(
+                in_c=_make_divisible(inp_channel * self.scale),
+                mid_c=_make_divisible(self.scale * exp),
+                out_c=_make_divisible(self.scale * c),
+                filter_size=k,
+                stride=s,
+                use_se=se,
+                act=act,
+                dilation=1))
+            inp_channel = _make_divisible(self.scale * c)
+
+    def forward(self, x):
+        if self.stem:
+            x = self.conv(x)
+
+        for i, block in enumerate(self.blocks):
+            x = block(x)
+        
+        return x
 
 
 class SeaFormer(nn.Module):
@@ -381,7 +474,11 @@ class SeaFormer(nn.Module):
                  norm_cfg=dict(type='BN', requires_grad=True),
                  act_layer=nn.ReLU6,
                  init_cfg=None,
-                 num_classes=1000):
+                 num_classes=1000,
+                 mv3=False, 
+                 pretrained_cfg=None, 
+                 drop_rate=0.0,
+                 drop_connect_rate=0.0):
         super().__init__()
         self.num_classes = num_classes
         self.channels = channels
@@ -393,7 +490,10 @@ class SeaFormer(nn.Module):
             self.pretrained = self.init_cfg['checkpoint']
 
         for i in range(len(cfgs)):
-            smb = StackedMV2Block(cfgs=cfgs[i], stem=True if i == 0 else False, inp_channel=channels[i], norm_cfg=norm_cfg)
+            if not mv3:
+                smb = StackedMV2Block(cfgs=cfgs[i], stem=True if i == 0 else False, inp_channel=channels[i], norm_cfg=norm_cfg)
+            else:
+                smb = StackedMV3Block(cfgs=cfgs[i], stem=True if i == 0 else False, inp_channel=channels[i], norm_cfg=norm_cfg)
             setattr(self, f"smb{i + 1}", smb)
 
         for i in range(len(depths)):
@@ -519,6 +619,43 @@ def SeaFormer_S(pretrained=False, **kwargs):
         mlp_ratios=model_cfgs['mlp_ratios'],
         num_heads=model_cfgs['num_heads'],
         drop_path_rate=model_cfgs['drop_path_rate'])
+
+
+@register_model
+def SeaFormer_MV3_Base(pretrained=False, **kwargs):
+    cfg1 = [
+        # k t c, s
+        [3, 16, 16, True, "relu", 1],
+        [3, 64, 32, False, "relu", 2],
+        [3, 96, 32, False, "relu", 1]
+    ]
+    cfg2 = [[5, 96, 64, True, "hardswish", 2],
+            [5, 240, 64, True, "hardswish", 1]]
+    cfg3 = [[5, 192, 128, True, "hardswish", 2],
+            [5, 384, 128, True, "hardswish", 1]]
+    cfg4 = [[5, 512, 192, True, "hardswish", 2]]
+    cfg5 = [[5, 1152, 256, True, "hardswish", 2]]
+    channels = [16, 32, 64, 128, 192, 256]
+    depths = [4, 4]
+    key_dims = [16, 24]
+    emb_dims = [192, 256]
+    num_heads = 8
+    drop_path_rate = 0.1
+
+    model = SeaFormer(
+        cfgs=[cfg1, cfg2, cfg3, cfg4, cfg5],
+        channels=channels,
+        emb_dims=emb_dims,
+        key_dims=key_dims,
+        depths=depths,
+        attn_ratios=2,
+        mlp_ratios=[2, 4],
+        num_heads=num_heads,
+        drop_path_rate=drop_path_rate,
+        act_layer=nn.ReLU6,
+        mv3=True,
+        **kwargs)
+    return model
 
 
 @register_model
