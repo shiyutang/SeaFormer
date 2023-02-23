@@ -8,7 +8,7 @@ from mmcv.cnn import build_norm_layer
 from timm.models.registry import register_model
 
 
-def _make_divisible(v, divisor=8, min_value=None):
+def _make_divisible(v, divisor, min_value=None):
     """
     This function is taken from the original tf repo.
     It ensures that all layers have a channel number that is divisible by 8
@@ -80,16 +80,10 @@ class Conv2d_BN(nn.Sequential):
         # self.bias = bias
         self.add_module('c', nn.Conv2d(
             a, b, ks, stride, pad, dilation, groups, bias=bias))
-        if norm_cfg != '':
-            if norm_cfg == 'hardswish':
-                bn = nn.Hardswish()
-            elif norm_cfg == 'relu':
-                bn = nn.ReLU()
-            else:       
-                bn = build_norm_layer(norm_cfg, b)[1]
-                nn.init.constant_(bn.weight, bn_weight_init)
-                nn.init.constant_(bn.bias, 0)
-            self.add_module('bn', bn)
+        bn = build_norm_layer(norm_cfg, b)[1]
+        nn.init.constant_(bn.weight, bn_weight_init)
+        nn.init.constant_(bn.bias, 0)
+        self.add_module('bn', bn)
 
 
 class Mlp(nn.Module):
@@ -209,9 +203,28 @@ class SqueezeAxialPositionalEmbedding(nn.Module):
         x = x + F.interpolate(self.pos_embed, size=(N), mode='linear', align_corners=False)
         
         return x
-    
-    
-class Sea_Attention(torch.nn.Module):
+
+# downsampling
+class LGQuery(torch.nn.Module):
+    def __init__(self, in_dim, out_dim, resolution1, resolution2):
+        super().__init__()
+        self.resolution1 = resolution1
+        self.resolution2 = resolution2
+        self.pool = nn.AvgPool2d(1, 2, 0)
+        self.local = nn.Sequential(nn.Conv2d(in_dim, in_dim, kernel_size=3, stride=2, padding=1, groups=in_dim),
+                                   )
+        self.proj = nn.Sequential(nn.Conv2d(in_dim, out_dim, 1),
+                                  nn.BatchNorm2d(out_dim), )
+
+    def forward(self, x):
+        local_q = self.local(x)
+        pool_q = self.pool(x)
+        q = local_q + pool_q
+        q = self.proj(q)
+        return q
+
+
+class Sea_AttentionDownsample(torch.nn.Module):
     def __init__(self, dim, key_dim, num_heads,
                  attn_ratio=2,
                  activation=None,
@@ -285,20 +298,140 @@ class Sea_Attention(torch.nn.Module):
         xx = self.sigmoid(xx) * qkv
         return xx
 
+    
+class Sea_Attention(torch.nn.Module):
+    def __init__(self, dim, key_dim, num_heads,
+                 attn_ratio=2,
+                 activation=None,
+                 norm_cfg=dict(type='BN', requires_grad=True), 
+                 talking_locality=False,
+                 stride_attention=False):
+        super().__init__()
+        self.talking_locality=talking_locality
+        self.stride_attention=stride_attention
+
+        if self.stride_attention:
+            self.stride_conv = nn.Sequential(nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1, groups=dim),
+                                             nn.BatchNorm2d(dim), )
+            self.upsample = nn.Upsample(scale_factor=2, mode='bilinear')
+        
+        self.num_heads = num_heads
+        self.scale = key_dim ** -0.5
+        self.key_dim = key_dim
+        self.nh_kd = nh_kd = key_dim * num_heads  # num_head key_dim
+        self.d = int(attn_ratio * key_dim)
+        self.dh = int(attn_ratio * key_dim) * num_heads
+        self.attn_ratio = attn_ratio
+
+        self.to_q = Conv2d_BN(dim, nh_kd, 1, norm_cfg=norm_cfg)
+        self.to_k = Conv2d_BN(dim, nh_kd, 1, norm_cfg=norm_cfg)
+        self.to_v = Conv2d_BN(dim, self.dh, 1, norm_cfg=norm_cfg)
+        
+        self.proj = torch.nn.Sequential(activation(), Conv2d_BN(
+            self.dh, dim, bn_weight_init=0, norm_cfg=norm_cfg))
+        self.proj_encode_row = torch.nn.Sequential(activation(), Conv2d_BN(
+            self.dh, self.dh, bn_weight_init=0, norm_cfg=norm_cfg))
+        self.pos_emb_rowq = SqueezeAxialPositionalEmbedding(nh_kd, 16)
+        self.pos_emb_rowk = SqueezeAxialPositionalEmbedding(nh_kd, 16)
+
+        self.proj_encode_column = torch.nn.Sequential(activation(), Conv2d_BN(
+            self.dh, self.dh, bn_weight_init=0, norm_cfg=norm_cfg))
+        self.pos_emb_columnq = SqueezeAxialPositionalEmbedding(nh_kd, 16)
+        self.pos_emb_columnk = SqueezeAxialPositionalEmbedding(nh_kd, 16)
+        
+        if not self.talking_locality:
+            self.dwconv = Conv2d_BN(self.dh + 2 * self.nh_kd, 2 * self.nh_kd + self.dh, ks=3, stride=1, pad=1, dilation=1,
+                                    groups=2 * self.nh_kd + self.dh, norm_cfg=norm_cfg) # 多了q，k的channles
+            self.act = activation()
+            self.pwconv = Conv2d_BN(2 * self.nh_kd + self.dh, dim, ks=1, norm_cfg=norm_cfg)
+            self.sigmoid = h_sigmoid()
+        else:
+            self.v_local = nn.Sequential(nn.Conv2d(self.dh, self.dh, kernel_size=3, stride=1, padding=1, groups=self.dh),
+                                         nn.BatchNorm2d(self.dh), )
+            # learn talking head
+            self.talking_head1 = nn.Conv2d(self.num_heads, self.num_heads, kernel_size=1, stride=1, padding=0)
+            self.talking_head2 = nn.Conv2d(self.num_heads, self.num_heads, kernel_size=1, stride=1, padding=0)
+            self.talking_head3 = nn.Conv2d(self.num_heads, self.num_heads, kernel_size=1, stride=1, padding=0)
+            self.talking_head4 = nn.Conv2d(self.num_heads, self.num_heads, kernel_size=1, stride=1, padding=0)
+
+
+    def forward(self, x):  
+        if self.stride_attention:
+            x = self.stride_conv(x)
+        B, C, H, W = x.shape
+
+        q = self.to_q(x)
+        k = self.to_k(x)
+        v = self.to_v(x)
+         
+        # detail enhance
+        if not self.talking_locality:
+            qkv = torch.cat([q, k, v], dim=1)
+            qkv = self.act(self.dwconv(qkv))
+            qkv = self.pwconv(qkv)
+        else:
+            v_local = self.v_local(v)
+
+        # squeeze axial attention
+        ## squeeze row
+        qrow = self.pos_emb_rowq(q.mean(-1)).reshape(B, self.num_heads, -1, H).permute(0, 1, 3, 2)
+        krow = self.pos_emb_rowk(k.mean(-1)).reshape(B, self.num_heads, -1, H)
+        vrow = v.mean(-1).reshape(B, self.num_heads, -1, H).permute(0, 1, 3, 2)
+        
+        attn_row = torch.matmul(qrow, krow) * self.scale
+        if not self.talking_locality:
+            attn_row = attn_row.softmax(dim=-1)
+        else:
+            attn_row = self.talking_head1(attn_row)
+            attn_row = attn_row.softmax(dim=-1)
+            attn_row = self.talking_head2(attn_row)
+        
+        xx_row = torch.matmul(attn_row, vrow)  # B nH H C
+        xx_row = self.proj_encode_row(xx_row.permute(0, 1, 3, 2).reshape(B, self.dh, H, 1))
+
+        ## squeeze column
+        qcolumn = self.pos_emb_columnq(q.mean(-2)).reshape(B, self.num_heads, -1, W).permute(0, 1, 3, 2)
+        kcolumn = self.pos_emb_columnk(k.mean(-2)).reshape(B, self.num_heads, -1, W)
+        vcolumn = v.mean(-2).reshape(B, self.num_heads, -1, W).permute(0, 1, 3, 2)
+        attn_column = torch.matmul(qcolumn, kcolumn) * self.scale
+        if not self.talking_locality:
+            attn_column = attn_column.softmax(dim=-1)
+        else:
+            attn_column = self.talking_head3(attn_column)
+            attn_column = attn_column.softmax(dim=-1)
+            attn_column = self.talking_head4(attn_column)
+        
+        xx_column = torch.matmul(attn_column, vcolumn)  # B nH W C
+        xx_column = self.proj_encode_column(xx_column.permute(0, 1, 3, 2).reshape(B, self.dh, 1, W))
+
+        xx = xx_row.add(xx_column)
+        xx = v.add(xx)
+        
+        if not self.talking_locality:
+            xx = self.proj(xx)
+            xx = self.sigmoid(xx) * qkv
+            if self.stride_attention:
+                xx = self.upsample(xx)
+        else:
+            xx = xx + v_local
+            if self.stride_attention:
+                xx = self.upsample(xx)
+            xx = self.proj(xx)
+
+        return xx
+
 
 class Block(nn.Module):
 
     def __init__(self, dim, key_dim, num_heads, mlp_ratio=4., attn_ratio=2., drop=0.,
-                 drop_path=0., act_layer=nn.ReLU, norm_cfg=dict(type='BN2d', requires_grad=True)):
+                 drop_path=0., act_layer=nn.ReLU, norm_cfg=dict(type='BN2d', requires_grad=True), stride_attention=None, talking_locality=None):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
-        # self.norm1 = nn.LayerNorm([dim,7,7])
-        # self.norm2 = nn.LayerNorm([dim, 4, 4])
        
         self.attn = Sea_Attention(dim, key_dim=key_dim, num_heads=num_heads, attn_ratio=attn_ratio,
-                                      activation=act_layer, norm_cfg=norm_cfg)
+                                      activation=act_layer, norm_cfg=norm_cfg, stride_attention=stride_attention, talking_locality=talking_locality)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -307,10 +440,6 @@ class Block(nn.Module):
     def forward(self, x1):
         x1 = x1 + self.drop_path(self.attn(x1))
         x1 = x1 + self.drop_path(self.mlp(x1))
-        # x1 = x1 + self.drop_path(self.attn(self.norm1(x1)))
-        # import pdb; pdb.set_trace()
-        # x1 = x1 + self.drop_path(self.attn(self.norm2(x1)))
-
         return x1
 
 
@@ -318,7 +447,7 @@ class BasicLayer(nn.Module):
     def __init__(self, block_num, embedding_dim, key_dim, num_heads,
                  mlp_ratio=4., attn_ratio=2., drop=0., attn_drop=0., drop_path=0.,
                  norm_cfg=dict(type='BN2d', requires_grad=True),
-                 act_layer=None):
+                 act_layer=None, talking_locality=None, stride_attention=None):
         super().__init__()
         self.block_num = block_num
 
@@ -329,7 +458,8 @@ class BasicLayer(nn.Module):
                 mlp_ratio=mlp_ratio, attn_ratio=attn_ratio,
                 drop=drop, drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_cfg=norm_cfg,
-                act_layer=act_layer))
+                act_layer=act_layer,
+                stride_attention=stride_attention, talking_locality=talking_locality))
 
     def forward(self, x):
         # token * N
@@ -347,120 +477,6 @@ class h_sigmoid(nn.Module):
         return self.relu(x + 3) / 6
 
 
-class SEModule(nn.Module):
-    def __init__(self, channel, reduction=4):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv1 = nn.Conv2d(
-            in_channels=channel,
-            out_channels=channel // reduction,
-            kernel_size=1,
-            stride=1,
-            padding=0)
-        self.relu = nn.ReLU()
-        self.conv2 = nn.Conv2d(
-            in_channels=channel // reduction,
-            out_channels=channel,
-            kernel_size=1,
-            stride=1,
-            padding=0)
-        self.hardsigmoid = nn.Hardsigmoid()
-
-    def forward(self, x):
-        identity = x
-        x = self.avg_pool(x)
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = self.conv2(x)
-        x = self.hardsigmoid(x)
-        out = torch.mul(input=identity, other=x)
-        return out
-
-
-class ResidualUnit(nn.Module):
-    def __init__(self,
-                 in_c,
-                 mid_c,
-                 out_c,
-                 filter_size,
-                 stride,
-                 use_se,
-                 act=None,
-                 dilation=1):
-        super().__init__()
-        self.if_shortcut = stride == 1 and in_c == out_c
-        self.if_se = use_se
-
-        self.expand_conv = Conv2d_BN(in_c, mid_c, 1, 1, 0, norm_cfg=act)
-        self.bottleneck_conv = Conv2d_BN(mid_c, mid_c, filter_size,stride, int((filter_size - 1) // 2) * dilation,
-                                dilation, mid_c, norm_cfg=act)
-        if self.if_se:
-            self.mid_se = SEModule(mid_c)
-        self.linear_conv = Conv2d_BN(mid_c, out_c, 1, 1, 0, norm_cfg='')
-
-
-    def forward(self, x):
-        identity = x
-        x = self.expand_conv(x)
-        x = self.bottleneck_conv(x)
-        if self.if_se:
-            x = self.mid_se(x)
-        
-        x = self.linear_conv(x)
-        if self.if_shortcut:
-            x = torch.add(identity, x)
-        return x
-
-
-class StackedMV3Block(nn.Module):
-    """
-    MobileNetV3
-    Args:
-        config: list. MobileNetV3 depthwise blocks config.
-        in_channels (int, optional): The channels of input image. Default: 3.
-        scale: float=1.0. The coefficient that controls the size of network parameters. 
-    Returns:
-        model: nn.Layer. Specific MobileNetV3 model depends on args.
-    """
-
-    def __init__(self,
-                 cfgs,
-                 stem,
-                 inp_channel,
-                 norm_cfg,
-                 in_channels=3,
-                 scale=1.0):
-        super().__init__()
-
-        self.scale = scale
-        self.stem = stem
-
-        if self.stem:
-            self.conv = Conv2d_BN(3, _make_divisible(inp_channel * self.scale), 3,2,1, norm_cfg='hardswish')
-        self.blocks = nn.ModuleList()
-        for i, (k, exp, c, se, act, s) in enumerate(cfgs):
-            self.blocks.append(            
-                ResidualUnit(
-                in_c=_make_divisible(inp_channel * self.scale),
-                mid_c=_make_divisible(self.scale * exp),
-                out_c=_make_divisible(self.scale * c),
-                filter_size=k,
-                stride=s,
-                use_se=se,
-                act=act,
-                dilation=1))
-            inp_channel = _make_divisible(self.scale * c)
-
-    def forward(self, x):
-        if self.stem:
-            x = self.conv(x)
-
-        for i, block in enumerate(self.blocks):
-            x = block(x)
-        
-        return x
-
-
 class SeaFormer(nn.Module):
     def __init__(self, cfgs,
                  channels,
@@ -474,11 +490,7 @@ class SeaFormer(nn.Module):
                  norm_cfg=dict(type='BN', requires_grad=True),
                  act_layer=nn.ReLU6,
                  init_cfg=None,
-                 num_classes=1000,
-                 mv3=False, 
-                 pretrained_cfg=None, 
-                 drop_rate=0.0,
-                 drop_connect_rate=0.0):
+                 num_classes=1000):
         super().__init__()
         self.num_classes = num_classes
         self.channels = channels
@@ -490,10 +502,7 @@ class SeaFormer(nn.Module):
             self.pretrained = self.init_cfg['checkpoint']
 
         for i in range(len(cfgs)):
-            if not mv3:
-                smb = StackedMV2Block(cfgs=cfgs[i], stem=True if i == 0 else False, inp_channel=channels[i], norm_cfg=norm_cfg)
-            else:
-                smb = StackedMV3Block(cfgs=cfgs[i], stem=True if i == 0 else False, inp_channel=channels[i], norm_cfg=norm_cfg)
+            smb = StackedMV2Block(cfgs=cfgs[i], stem=True if i == 0 else False, inp_channel=channels[i], norm_cfg=norm_cfg)
             setattr(self, f"smb{i + 1}", smb)
 
         for i in range(len(depths)):
@@ -508,7 +517,9 @@ class SeaFormer(nn.Module):
                 drop=0, attn_drop=0,
                 drop_path=dpr,
                 norm_cfg=norm_cfg,
-                act_layer=act_layer)
+                act_layer=act_layer,
+                stride_attention=i==0,
+                talking_locality=False)
             setattr(self, f"trans{i + 1}", trans)  
 
         self.linear = nn.Linear(channels[-1], 1000)
@@ -622,43 +633,6 @@ def SeaFormer_S(pretrained=False, **kwargs):
 
 
 @register_model
-def SeaFormer_MV3_Base(pretrained=False, **kwargs):
-    cfg1 = [
-        # k t c, s
-        [3, 16, 16, True, "relu", 1],
-        [3, 64, 32, False, "relu", 2],
-        [3, 96, 32, False, "relu", 1]
-    ]
-    cfg2 = [[5, 96, 64, True, "hardswish", 2],
-            [5, 240, 64, True, "hardswish", 1]]
-    cfg3 = [[5, 192, 128, True, "hardswish", 2],
-            [5, 384, 128, True, "hardswish", 1]]
-    cfg4 = [[5, 512, 192, True, "hardswish", 2]]
-    cfg5 = [[5, 1152, 256, True, "hardswish", 2]]
-    channels = [16, 32, 64, 128, 192, 256]
-    depths = [4, 4]
-    key_dims = [16, 24]
-    emb_dims = [192, 256]
-    num_heads = 8
-    drop_path_rate = 0.1
-
-    model = SeaFormer(
-        cfgs=[cfg1, cfg2, cfg3, cfg4, cfg5],
-        channels=channels,
-        emb_dims=emb_dims,
-        key_dims=key_dims,
-        depths=depths,
-        attn_ratios=2,
-        mlp_ratios=[2, 4],
-        num_heads=num_heads,
-        drop_path_rate=drop_path_rate,
-        act_layer=nn.ReLU6,
-        mv3=True,
-        **kwargs)
-    return model
-
-
-@register_model
 def SeaFormer_B(pretrained=False, **kwargs):
     model_cfgs = dict(
         cfg1=[
@@ -678,12 +652,12 @@ def SeaFormer_B(pretrained=False, **kwargs):
             [3, 6, 256, 2]],
         channels=[16, 32, 64, 128, 192, 256],
         num_heads=8,
-        depths=[4, 4],
-        key_dims=[16, 24],
-        emb_dims=[192, 256],
+        depths=[3, 4, 4],
+        key_dims=[8, 16, 24],
+        emb_dims=[128, 192, 256],
         drop_path_rate=0.1,
         attn_ratios=2,
-        mlp_ratios=[2, 4])
+        mlp_ratios=[2, 2, 4])
     return SeaFormer(
         cfgs=[model_cfgs['cfg1'], model_cfgs['cfg2'], model_cfgs['cfg3'], model_cfgs['cfg4'], model_cfgs['cfg5']],
         channels=model_cfgs['channels'],
