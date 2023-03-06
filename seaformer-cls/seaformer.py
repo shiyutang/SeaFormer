@@ -500,7 +500,6 @@ class h_sigmoid(nn.Module):
     def forward(self, x):
         return self.relu(x + 3) / 6
 
-
 class SEModule(nn.Module):
     def __init__(self, channel, reduction=4):
         super().__init__()
